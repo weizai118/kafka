@@ -34,6 +34,8 @@ import org.apache.kafka.common.acl.AclBinding;
 import org.apache.kafka.common.acl.AclBindingFilter;
 import org.apache.kafka.common.acl.AclOperation;
 import org.apache.kafka.common.acl.AclPermissionType;
+import org.apache.kafka.common.resource.ResourcePattern;
+import org.apache.kafka.common.resource.ResourcePatternFilter;
 import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.errors.AuthenticationException;
 import org.apache.kafka.common.errors.CoordinatorNotAvailableException;
@@ -65,8 +67,7 @@ import org.apache.kafka.common.requests.ListGroupsResponse;
 import org.apache.kafka.common.requests.MetadataRequest;
 import org.apache.kafka.common.requests.MetadataResponse;
 import org.apache.kafka.common.requests.OffsetFetchResponse;
-import org.apache.kafka.common.resource.Resource;
-import org.apache.kafka.common.resource.ResourceFilter;
+import org.apache.kafka.common.resource.ResourceNameType;
 import org.apache.kafka.common.resource.ResourceType;
 import org.apache.kafka.common.utils.MockTime;
 import org.apache.kafka.common.utils.Time;
@@ -183,8 +184,8 @@ public class KafkaAdminClientTest {
         nodes.put(1, new Node(1, "localhost", 8122));
         nodes.put(2, new Node(2, "localhost", 8123));
         return new Cluster("mockClusterId", nodes.values(),
-                Collections.<PartitionInfo>emptySet(), Collections.<String>emptySet(),
-                Collections.<String>emptySet(), nodes.get(controllerIndex));
+                Collections.emptySet(), Collections.emptySet(),
+                Collections.emptySet(), nodes.get(controllerIndex));
     }
 
     private static AdminClientUnitTestEnv mockClientEnv(String... configVals) {
@@ -192,7 +193,7 @@ public class KafkaAdminClientTest {
     }
 
     @Test
-    public void testCloseAdminClient() throws Exception {
+    public void testCloseAdminClient() {
         try (AdminClientUnitTestEnv env = mockClientEnv()) {
         }
     }
@@ -229,6 +230,60 @@ public class KafkaAdminClientTest {
                     Collections.singleton(new NewTopic("myTopic", Collections.singletonMap(0, asList(0, 1, 2)))),
                     new CreateTopicsOptions().timeoutMs(1000)).all();
             assertFutureError(future, TimeoutException.class);
+        }
+    }
+
+    @Test
+    public void testConnectionFailureOnMetadataUpdate() throws Exception {
+        // This tests the scenario in which we successfully connect to the bootstrap server, but
+        // the server disconnects before sending the full response
+
+        Cluster cluster = Cluster.bootstrap(Collections.singletonList(new InetSocketAddress("localhost", 8121)));
+        MockClient mockClient = new MockClient(Time.SYSTEM);
+        mockClient.setNodeApiVersions(NodeApiVersions.create());
+        mockClient.setNode(cluster.nodes().get(0));
+
+        try (final AdminClientUnitTestEnv env = new AdminClientUnitTestEnv(mockClient, Time.SYSTEM, cluster)) {
+            Cluster discoveredCluster = mockCluster(0);
+            env.kafkaClient().prepareResponse(request -> request instanceof MetadataRequest, null, true);
+            env.kafkaClient().prepareResponse(body -> body instanceof MetadataRequest,
+                    new  MetadataResponse(discoveredCluster.nodes(), discoveredCluster.clusterResource().clusterId(),
+                            1, Collections.emptyList()));
+            env.kafkaClient().prepareResponse(body -> body instanceof CreateTopicsRequest,
+                    new CreateTopicsResponse(Collections.singletonMap("myTopic", new ApiError(Errors.NONE, ""))));
+
+            KafkaFuture<Void> future = env.adminClient().createTopics(
+                    Collections.singleton(new NewTopic("myTopic", Collections.singletonMap(0, asList(0, 1, 2)))),
+                    new CreateTopicsOptions().timeoutMs(10000)).all();
+
+            future.get();
+        }
+    }
+
+    @Test
+    public void testUnreachableBootstrapServer() throws Exception {
+        // This tests the scenario in which the bootstrap server is unreachable for a short while,
+        // which prevents AdminClient from being able to send the initial metadata request
+
+        Cluster cluster = Cluster.bootstrap(Collections.singletonList(new InetSocketAddress("localhost", 8121)));
+        MockClient mockClient = new MockClient(Time.SYSTEM);
+        mockClient.setNodeApiVersions(NodeApiVersions.create());
+        mockClient.setNode(cluster.nodes().get(0));
+        mockClient.setUnreachable(cluster.nodes().get(0), 200);
+
+        try (final AdminClientUnitTestEnv env = new AdminClientUnitTestEnv(mockClient, Time.SYSTEM, cluster)) {
+            Cluster discoveredCluster = mockCluster(0);
+            env.kafkaClient().prepareResponse(body -> body instanceof MetadataRequest,
+                    new  MetadataResponse(discoveredCluster.nodes(), discoveredCluster.clusterResource().clusterId(),
+                            1, Collections.emptyList()));
+            env.kafkaClient().prepareResponse(body -> body instanceof CreateTopicsRequest,
+                    new CreateTopicsResponse(Collections.singletonMap("myTopic", new ApiError(Errors.NONE, ""))));
+
+            KafkaFuture<Void> future = env.adminClient().createTopics(
+                    Collections.singleton(new NewTopic("myTopic", Collections.singletonMap(0, asList(0, 1, 2)))),
+                    new CreateTopicsOptions().timeoutMs(10000)).all();
+
+            future.get();
         }
     }
 
@@ -482,13 +537,13 @@ public class KafkaAdminClientTest {
         }
     }
 
-    private static final AclBinding ACL1 = new AclBinding(new Resource(ResourceType.TOPIC, "mytopic3"),
+    private static final AclBinding ACL1 = new AclBinding(new ResourcePattern(ResourceType.TOPIC, "mytopic3", ResourceNameType.LITERAL),
         new AccessControlEntry("User:ANONYMOUS", "*", AclOperation.DESCRIBE, AclPermissionType.ALLOW));
-    private static final AclBinding ACL2 = new AclBinding(new Resource(ResourceType.TOPIC, "mytopic4"),
+    private static final AclBinding ACL2 = new AclBinding(new ResourcePattern(ResourceType.TOPIC, "mytopic4", ResourceNameType.LITERAL),
         new AccessControlEntry("User:ANONYMOUS", "*", AclOperation.DESCRIBE, AclPermissionType.DENY));
-    private static final AclBindingFilter FILTER1 = new AclBindingFilter(new ResourceFilter(ResourceType.ANY, null),
+    private static final AclBindingFilter FILTER1 = new AclBindingFilter(new ResourcePatternFilter(ResourceType.ANY, null, ResourceNameType.LITERAL),
         new AccessControlEntryFilter("User:ANONYMOUS", null, AclOperation.ANY, AclPermissionType.ANY));
-    private static final AclBindingFilter FILTER2 = new AclBindingFilter(new ResourceFilter(ResourceType.ANY, null),
+    private static final AclBindingFilter FILTER2 = new AclBindingFilter(new ResourcePatternFilter(ResourceType.ANY, null, ResourceNameType.LITERAL),
         new AccessControlEntryFilter("User:bob", null, AclOperation.ANY, AclPermissionType.ANY));
 
     @Test
